@@ -1,9 +1,12 @@
 import logging
 import os
+import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -26,7 +29,7 @@ from telegram.ext import (
 # ---------------------------------------------------------
 # VERSION & ENV
 # ---------------------------------------------------------
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.3.0"
 
 load_dotenv()
 
@@ -50,7 +53,9 @@ if not ADMIN_IDS:
     WAITING_BAN_ID,
     WAITING_FLOOD_LIMIT,
     WAITING_LOG_CHANNEL,
-) = range(9)
+    WAITING_PROMO_LINK,
+    WAITING_DOWNLOAD_LIMIT,
+) = range(11)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -129,6 +134,10 @@ def init_db():
         cursor.execute("ALTER TABLE posts ADD COLUMN file_id TEXT")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE posts ADD COLUMN download_limit INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS post_files (
@@ -171,10 +180,32 @@ def init_db():
             file_type TEXT,
             file_id TEXT,
             caption TEXT,
-            is_active INTEGER DEFAULT 0
+            is_active INTEGER DEFAULT 0,
+            show_count INTEGER DEFAULT 0,
+            forward_chat_id TEXT,
+            forward_message_id INTEGER,
+            pin_enabled INTEGER DEFAULT 0
         )
     ''')
     cursor.execute("INSERT OR IGNORE INTO promo (id, is_active) VALUES (1, 0)")
+    for col, typ in [
+        ("show_count", "INTEGER DEFAULT 0"),
+        ("forward_chat_id", "TEXT"),
+        ("forward_message_id", "INTEGER"),
+        ("pin_enabled", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE promo ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promo_pins (
+            user_id INTEGER PRIMARY KEY,
+            message_id INTEGER,
+            pinned_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
@@ -188,6 +219,8 @@ def init_db():
         "flood_limit": "10",
         "flood_seconds": "60",
         "log_channel_id": "",
+        "default_download_limit": "0",
+        "daily_report_hour": "21",
     }
     for k, v in defaults.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -392,6 +425,36 @@ async def process_file_delivery(update, context, user_id, post_id):
         conn.close()
         return
 
+    # محدودیت دانلود هر کاربر برای این لینک
+    cursor.execute("SELECT download_limit FROM posts WHERE post_id = ?", (post_id,))
+    lim_row = cursor.fetchone()
+    post_limit = lim_row[0] if lim_row and lim_row[0] is not None else None
+    if post_limit is None:
+        post_limit = 0
+    if post_limit == 0:
+        try:
+            post_limit = int(get_setting("default_download_limit", "0") or "0")
+        except Exception:
+            post_limit = 0
+
+    if post_limit > 0 and not is_admin(user_id):
+        cursor.execute(
+            "SELECT COUNT(*) FROM link_events WHERE post_id = ? AND user_id = ? AND action = 'download'",
+            (post_id, user_id),
+        )
+        user_dl = cursor.fetchone()[0] or 0
+        if user_dl >= post_limit:
+            msg = (
+                f"🚫 شما به سقف دانلود این لینک رسیده‌اید.\n"
+                f"حد مجاز: {post_limit} بار | دانلود شما: {user_dl}"
+            )
+            if update.callback_query:
+                await update.callback_query.message.reply_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            conn.close()
+            return
+
     # get files
     cursor.execute("SELECT file_type, file_id FROM post_files WHERE post_id = ? ORDER BY sort_order, id", (post_id,))
     files = cursor.fetchall()
@@ -466,25 +529,55 @@ async def process_file_delivery(update, context, user_id, post_id):
         return
 
     # promo
-    cursor.execute("SELECT file_type, file_id, caption, is_active FROM promo WHERE id = 1")
+    cursor.execute(
+        "SELECT file_type, file_id, caption, is_active, forward_chat_id, forward_message_id, pin_enabled "
+        "FROM promo WHERE id = 1"
+    )
     promo = cursor.fetchone()
-    conn.close()
 
     if promo and promo[3] == 1:
         p_type, p_file_id, p_caption = promo[0], promo[1], promo[2]
+        fwd_chat, fwd_msg, pin_on = promo[4], promo[5], promo[6]
+        sent_msg = None
         try:
-            if p_type == 'photo' and p_file_id:
-                await context.bot.send_photo(chat_id=user_id, photo=p_file_id, caption=p_caption or "")
+            if fwd_chat and fwd_msg:
+                sent_msg = await context.bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=int(fwd_chat),
+                    message_id=int(fwd_msg),
+                )
+            elif p_type == 'photo' and p_file_id:
+                sent_msg = await context.bot.send_photo(chat_id=user_id, photo=p_file_id, caption=p_caption or "")
             elif p_type == 'document' and p_file_id:
-                await context.bot.send_document(chat_id=user_id, document=p_file_id, caption=p_caption or "")
+                sent_msg = await context.bot.send_document(chat_id=user_id, document=p_file_id, caption=p_caption or "")
             elif p_type == 'video' and p_file_id:
-                await context.bot.send_video(chat_id=user_id, video=p_file_id, caption=p_caption or "")
+                sent_msg = await context.bot.send_video(chat_id=user_id, video=p_file_id, caption=p_caption or "")
             elif p_type == 'animation' and p_file_id:
-                await context.bot.send_animation(chat_id=user_id, animation=p_file_id, caption=p_caption or "")
+                sent_msg = await context.bot.send_animation(chat_id=user_id, animation=p_file_id, caption=p_caption or "")
             elif p_caption:
-                await context.bot.send_message(chat_id=user_id, text=p_caption)
+                sent_msg = await context.bot.send_message(chat_id=user_id, text=p_caption)
+
+            cursor.execute("UPDATE promo SET show_count = show_count + 1 WHERE id = 1")
+            conn.commit()
+
+            if pin_on and sent_msg:
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=user_id,
+                        message_id=sent_msg.message_id,
+                        disable_notification=True,
+                    )
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO promo_pins (user_id, message_id) VALUES (?, ?)",
+                        (user_id, sent_msg.message_id),
+                    )
+                    conn.commit()
+                except Exception as pe:
+                    logger.error(f"Pin promo error: {pe}")
         except Exception as e:
             logger.error(f"Error sending promo: {e}")
+
+    conn.close()
 
 async def handle_verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -745,7 +838,8 @@ async def view_post_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT is_active, clicks_count, downloads_count, last_used_at, created_at FROM posts WHERE post_id = ?",
+        "SELECT is_active, clicks_count, downloads_count, last_used_at, created_at, download_limit "
+        "FROM posts WHERE post_id = ?",
         (post_id,)
     )
     post = cursor.fetchone()
@@ -754,12 +848,18 @@ async def view_post_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("❌ پست یافت نشد.")
         return
 
-    is_active, clicks, downloads, last_used, created = post
+    is_active, clicks, downloads, last_used, created, dl_limit = post
+    if dl_limit is None:
+        dl_limit = 0
+    default_lim = get_setting("default_download_limit", "0")
+    limit_label = "نامحدود" if dl_limit == 0 else str(dl_limit)
+    if dl_limit == 0 and default_lim and default_lim != "0":
+        limit_label = f"پیش‌فرض سراسری ({default_lim})"
 
     cursor.execute("SELECT COUNT(*) FROM post_files WHERE post_id = ?", (post_id,))
     file_count = cursor.fetchone()[0] or 0
     if file_count == 0:
-        file_count = 1  # old single file
+        file_count = 1
 
     cursor.execute(
         "SELECT COUNT(*) FROM link_events WHERE post_id = ? AND action='click' AND created_at >= datetime('now', '-1 day')",
@@ -785,22 +885,24 @@ async def view_post_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = f"https://t.me/{bot_username}?start={post_id}"
 
     text = (
-        f"📊 **مدیریت پست:** `{post_id}`\n\n"
-        f"🔗 `{link}`\n"
+        f"📊 مدیریت پست: {post_id}\n\n"
+        f"🔗 {link}\n"
         f"⚙️ وضعیت: {status_str}\n"
-        f"📎 تعداد فایل: `{file_count}`\n\n"
-        f"👆 کلیک کل: `{clicks}` | ۲۴س: `{c24}` | ۷روز: `{c7}`\n"
-        f"📥 دانلود کل: `{downloads}` | ۲۴س: `{d24}`\n"
-        f"🕒 آخرین استفاده: `{last_used or '—'}`\n"
-        f"📅 تاریخ ساخت: `{created or '—'}`"
+        f"📎 تعداد فایل: {file_count}\n"
+        f"🔢 سقف دانلود هر کاربر: {limit_label}\n\n"
+        f"👆 کلیک کل: {clicks} | ۲۴س: {c24} | ۷روز: {c7}\n"
+        f"📥 دانلود کل: {downloads} | ۲۴س: {d24}\n"
+        f"🕒 آخرین استفاده: {last_used or '—'}\n"
+        f"📅 تاریخ ساخت: {created or '—'}"
     )
 
     keyboard = [
         [InlineKeyboardButton(toggle_str, callback_data=f"toggle_post_{post_id}")],
+        [InlineKeyboardButton("🔢 تنظیم سقف دانلود", callback_data=f"set_dl_limit_{post_id}")],
         [InlineKeyboardButton("🗑 حذف پست", callback_data=f"delete_post_{post_id}")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="admin_manage_posts")]
     ]
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def toggle_post_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -830,39 +932,133 @@ async def delete_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("✅ پست حذف شد.", show_alert=True)
     await manage_posts(update, context)
 
+
+async def start_set_dl_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    post_id = query.data.replace("set_dl_limit_", "")
+    context.user_data["edit_dl_limit_post"] = post_id
+    await query.message.edit_text(
+        f"🔢 سقف دانلود برای پست `{post_id}`\n\n"
+        f"عدد بفرستید:\n"
+        f"• `0` = نامحدود\n"
+        f"• `1` = فقط یک بار برای هر کاربر\n"
+        f"• `3` = حداکثر ۳ بار\n\n"
+        f"برای تنظیم پیش‌فرض سراسری همه لینک‌ها:\n"
+        f"`default 2`",
+        parse_mode="Markdown",
+    )
+    return WAITING_DOWNLOAD_LIMIT
+
+
+async def receive_dl_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().lower()
+    post_id = context.user_data.get("edit_dl_limit_post")
+
+    try:
+        if text.startswith("default"):
+            num = int(text.replace("default", "").strip() or "0")
+            if num < 0:
+                raise ValueError
+            set_setting("default_download_limit", str(num))
+            await update.message.reply_text(
+                f"✅ پیش‌فرض سراسری سقف دانلود: {'نامحدود' if num == 0 else num}"
+            )
+        else:
+            num = int(text)
+            if num < 0:
+                raise ValueError
+            if not post_id:
+                await update.message.reply_text("❌ پست مشخص نیست. از پنل دوباره شروع کنید.")
+                await admin_panel(update, context)
+                return ConversationHandler.END
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE posts SET download_limit = ? WHERE post_id = ?", (num, post_id))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(
+                f"✅ سقف دانلود `{post_id}`: {'نامحدود' if num == 0 else num}",
+                parse_mode="Markdown",
+            )
+    except ValueError:
+        await update.message.reply_text("❌ عدد نامعتبر. مثال: `1` یا `default 2`", parse_mode="Markdown")
+        return WAITING_DOWNLOAD_LIMIT
+
+    context.user_data.pop("edit_dl_limit_post", None)
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+
 # ---------------------------------------------------------
 # PROMO
 # ---------------------------------------------------------
+def parse_telegram_post_link(url: str):
+    """برمی‌گرداند (chat_id, message_id) یا None"""
+    url = url.strip()
+    # https://t.me/c/1234567890/123  (خصوصی)
+    m = re.search(r't\.me/c/(\d+)/(\d+)', url)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
+    # https://t.me/username/123
+    m = re.search(r't\.me/([A-Za-z0-9_]+)/(\d+)', url)
+    if m and m.group(1).lower() not in ('c', 'joinchat'):
+        return m.group(1), int(m.group(2))
+    return None
+
+
 async def promo_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT file_type, file_id, caption, is_active FROM promo WHERE id = 1")
+    cursor.execute(
+        "SELECT file_type, file_id, caption, is_active, show_count, forward_chat_id, "
+        "forward_message_id, pin_enabled FROM promo WHERE id = 1"
+    )
     promo = cursor.fetchone()
     conn.close()
 
-    file_type, file_id, caption, is_active = promo if promo else (None, None, None, 0)
+    if not promo:
+        file_type = file_id = caption = None
+        is_active = show_count = pin_enabled = 0
+        fwd_chat = fwd_msg = None
+    else:
+        file_type, file_id, caption, is_active, show_count, fwd_chat, fwd_msg, pin_enabled = promo
+
     status_str = "فعال 🟢" if is_active == 1 else "غیرفعال 🔴"
     toggle_str = "غیرفعال‌سازی ❌" if is_active == 1 else "فعال‌سازی ✅"
-    content_info = "ندارد"
-    if file_id:
+    pin_str = "پین: روشن 📌" if pin_enabled else "پین: خاموش"
+    pin_btn = "خاموش کردن پین" if pin_enabled else "فعال کردن پین"
+
+    if fwd_chat and fwd_msg:
+        content_info = f"فوروارد از پست ({fwd_chat}/{fwd_msg})"
+    elif file_id:
         content_info = f"دارد ({file_type or 'فایل'})"
     elif caption:
         content_info = "فقط متن"
+    else:
+        content_info = "ندارد"
 
     text = (
-        f"💎 **تبلیغ زیروند**\n\n"
+        f"💎 تبلیغ زیروند\n\n"
         f"⚙️ وضعیت: {status_str}\n"
         f"📝 محتوا: {content_info}\n"
-        f"📄 کپشن: {caption or '—'}"
+        f"📄 کپشن: {caption or '—'}\n"
+        f"📌 پین خودکار: {'بله' if pin_enabled else 'خیر'}\n"
+        f"👁 تعداد نمایش به کاربران: {show_count or 0}"
     )
     keyboard = [
         [InlineKeyboardButton(toggle_str, callback_data="toggle_promo")],
-        [InlineKeyboardButton("✏️ تغییر تبلیغ", callback_data="set_promo")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")]
+        [InlineKeyboardButton(pin_btn, callback_data="toggle_promo_pin")],
+        [InlineKeyboardButton("✏️ آپلود فایل/متن تبلیغ", callback_data="set_promo")],
+        [InlineKeyboardButton("🔗 تنظیم از لینک پست (فوروارد)", callback_data="set_promo_link")],
+        [InlineKeyboardButton("📍 آنپین همه پیام‌های تبلیغ", callback_data="unpin_all_promo")],
+        [InlineKeyboardButton("🔄 ریست شمارنده نمایش", callback_data="reset_promo_count")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")],
     ]
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def toggle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -874,11 +1070,59 @@ async def toggle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await promo_settings(update, context)
 
+
+async def toggle_promo_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promo SET pin_enabled = CASE WHEN pin_enabled = 1 THEN 0 ELSE 1 END WHERE id = 1")
+    conn.commit()
+    conn.close()
+    await promo_settings(update, context)
+
+
+async def reset_promo_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("شمارنده ریست شد ✅", show_alert=True)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promo SET show_count = 0 WHERE id = 1")
+    conn.commit()
+    conn.close()
+    await promo_settings(update, context)
+
+
+async def unpin_all_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, message_id FROM promo_pins")
+    rows = cursor.fetchall()
+    success, fail = 0, 0
+    for uid, mid in rows:
+        try:
+            await context.bot.unpin_chat_message(chat_id=uid, message_id=mid)
+            success += 1
+        except Exception:
+            fail += 1
+    cursor.execute("DELETE FROM promo_pins")
+    conn.commit()
+    conn.close()
+    await query.message.reply_text(f"📍 آنپین انجام شد.\n✅ موفق: {success}\n❌ ناموفق: {fail}")
+    await promo_settings(update, context)
+
+
 async def start_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.edit_text("📸/📝 عکس، ویدیو، فایل یا متن تبلیغ را بفرستید:")
+    await query.message.edit_text(
+        "📸/📝 عکس، ویدیو، فایل یا متن تبلیغ را بفرستید:\n"
+        "(برای فوروارد از کانال از دکمه «لینک پست» استفاده کنید)"
+    )
     return WAITING_PROMO_CONTENT
+
 
 async def receive_promo_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -894,6 +1138,26 @@ async def receive_promo_content(update: Update, context: ContextTypes.DEFAULT_TY
         file_type, file_id = 'video', msg.video.file_id
     elif msg.animation:
         file_type, file_id = 'animation', msg.animation.file_id
+    elif msg.forward_from_chat or msg.forward_origin:
+        # پیام فوروارد شده مستقیم
+        try:
+            from_chat = msg.forward_from_chat.id if msg.forward_from_chat else None
+            from_msg = msg.forward_from_message_id
+            if from_chat and from_msg:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE promo SET file_type=NULL, file_id=NULL, caption=NULL, "
+                    "forward_chat_id=?, forward_message_id=?, is_active=1 WHERE id=1",
+                    (str(from_chat), from_msg),
+                )
+                conn.commit()
+                conn.close()
+                await update.message.reply_text("✅ تبلیغ از پیام فوروارد ذخیره و فعال شد.")
+                await admin_panel(update, context)
+                return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"forward promo save: {e}")
     elif msg.text:
         file_type, file_id = 'text', None
         caption = msg.text
@@ -901,12 +1165,75 @@ async def receive_promo_content(update: Update, context: ContextTypes.DEFAULT_TY
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE promo SET file_type = ?, file_id = ?, caption = ?, is_active = 1 WHERE id = 1",
-        (file_type, file_id, caption)
+        "UPDATE promo SET file_type=?, file_id=?, caption=?, forward_chat_id=NULL, "
+        "forward_message_id=NULL, is_active=1 WHERE id=1",
+        (file_type, file_id, caption),
     )
     conn.commit()
     conn.close()
     await update.message.reply_text("✅ تبلیغ ذخیره و فعال شد.")
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+
+async def start_set_promo_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text(
+        "🔗 لینک پست کانال را بفرستید:\n\n"
+        "مثال:\n"
+        "https://t.me/channelname/123\n"
+        "https://t.me/c/1234567890/55\n\n"
+        "⚠️ ربات باید در آن کانال عضو/ادمین باشد تا بتواند فوروارد کند."
+    )
+    return WAITING_PROMO_LINK
+
+
+async def receive_promo_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    parsed = parse_telegram_post_link(text)
+    if not parsed:
+        await update.message.reply_text("❌ لینک نامعتبر است. دوباره بفرستید یا /cancel")
+        return WAITING_PROMO_LINK
+
+    chat_ref, msg_id = parsed
+    bot = context.bot
+    try:
+        # resolve username to id if needed
+        if isinstance(chat_ref, str):
+            chat = await bot.get_chat(f"@{chat_ref}" if not chat_ref.startswith("@") else chat_ref)
+            chat_id = chat.id
+        else:
+            chat_id = chat_ref
+
+        # test forward to admin
+        test = await bot.forward_message(
+            chat_id=update.effective_user.id,
+            from_chat_id=chat_id,
+            message_id=msg_id,
+        )
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE promo SET file_type=NULL, file_id=NULL, caption=NULL, "
+            "forward_chat_id=?, forward_message_id=?, is_active=1 WHERE id=1",
+            (str(chat_id), msg_id),
+        )
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ تبلیغ از لینک ذخیره و فعال شد.\n"
+            f"پیش‌نمایش بالا فوروارد شد.\n"
+            f"chat: {chat_id} | msg: {msg_id}"
+        )
+    except Exception as e:
+        logger.error(f"promo link error: {e}")
+        await update.message.reply_text(
+            f"❌ نتوانستم پست را فوروارد کنم.\n{e}\n\n"
+            "ربات باید در کانال عضو باشد و پست عمومی/قابل‌دسترسی باشد."
+        )
+        return WAITING_PROMO_LINK
+
     await admin_panel(update, context)
     return ConversationHandler.END
 
@@ -1226,13 +1553,16 @@ async def admin_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     current = get_setting("log_channel_id", "") or "تنظیم نشده"
+    report_hour = get_setting("daily_report_hour", "21")
     await query.message.edit_text(
-        f"📡 **کانال لاگ ساعتی**\n\n"
-        f"آیدی فعلی: `{current}`\n\n"
-        f"آیدی عددی کانال را بفرستید (مثال: `-100123456789`)\n"
-        f"ربات باید ادمین کانال باشد.\n"
-        f"برای غیرفعال: `off`",
-        parse_mode="Markdown"
+        f"📡 کانال لاگ\n\n"
+        f"آیدی فعلی: {current}\n"
+        f"ساعت گزارش روزانه: {report_hour}:00 (وقت سرور)\n\n"
+        f"آیدی عددی کانال را بفرستید (مثال: -100123456789)\n"
+        f"ربات باید ادمین کانال باشد.\n\n"
+        f"برای تغییر ساعت گزارش روزانه:\n"
+        f"hour 21\n\n"
+        f"برای غیرفعال: off"
     )
     return WAITING_LOG_CHANNEL
 
@@ -1240,12 +1570,22 @@ async def receive_log_channel(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text.strip()
     if text.lower() in ("off", "0", "none", "غیرفعال"):
         set_setting("log_channel_id", "")
-        await update.message.reply_text("✅ لاگ ساعتی غیرفعال شد.")
+        await update.message.reply_text("✅ کانال لاگ غیرفعال شد.")
+    elif text.lower().startswith("hour"):
+        try:
+            h = int(text.lower().replace("hour", "").strip())
+            if not (0 <= h <= 23):
+                raise ValueError
+            set_setting("daily_report_hour", str(h))
+            await update.message.reply_text(f"✅ ساعت گزارش روزانه: {h}:00")
+        except ValueError:
+            await update.message.reply_text("❌ ساعت نامعتبر (۰ تا ۲۳). مثال: hour 21")
+            return WAITING_LOG_CHANNEL
     else:
         try:
             cid = int(text)
             set_setting("log_channel_id", str(cid))
-            await update.message.reply_text(f"✅ کانال لاگ تنظیم شد: `{cid}`", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ کانال لاگ تنظیم شد: {cid}")
         except ValueError:
             await update.message.reply_text("❌ آیدی نامعتبر.")
             return WAITING_LOG_CHANNEL
@@ -1268,16 +1608,92 @@ async def hourly_log_job(context: ContextTypes.DEFAULT_TYPE):
         posts = cursor.fetchone()[0] or 0
         conn.close()
         text = (
-            f"📡 **لاگ ساعتی ربات** v{BOT_VERSION}\n"
+            f"📡 لاگ ساعتی ربات v{BOT_VERSION}\n"
             f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"👤 کاربران: `{total_users}`\n"
-            f"📁 پست‌ها: `{posts}`\n"
-            f"👆 کلیک ۱ ساعت اخیر: `{c1h}`\n"
-            f"📥 دانلود ۱ ساعت اخیر: `{d1h}`"
+            f"👤 کاربران: {total_users}\n"
+            f"📁 پست‌ها: {posts}\n"
+            f"👆 کلیک ۱ ساعت اخیر: {c1h}\n"
+            f"📥 دانلود ۱ ساعت اخیر: {d1h}"
         )
-        await context.bot.send_message(chat_id=int(log_ch), text=text, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=int(log_ch), text=text)
     except Exception as e:
         logger.error(f"Hourly log error: {e}")
+
+
+async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """گزارش روزانه خودکار به کانال لاگ"""
+    log_ch = get_setting("log_channel_id", "")
+    if not log_ch:
+        return
+    try:
+        total_users = db_get_users_count()
+        banned = db_get_banned_count()
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM users WHERE joined_at >= datetime('now', '-1 day')")
+        new_users = cursor.fetchone()[0] or 0
+
+        cursor.execute("SELECT COUNT(*) FROM link_events WHERE action='click' AND created_at >= datetime('now', '-1 day')")
+        clicks_24 = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM link_events WHERE action='download' AND created_at >= datetime('now', '-1 day')")
+        downloads_24 = cursor.fetchone()[0] or 0
+
+        cursor.execute("SELECT COUNT(*) FROM posts")
+        total_posts = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(*) FROM posts WHERE is_active = 1")
+        active_posts = cursor.fetchone()[0] or 0
+
+        cursor.execute(
+            "SELECT post_id, downloads_count FROM posts ORDER BY downloads_count DESC LIMIT 5"
+        )
+        top_posts = cursor.fetchall()
+
+        cursor.execute("SELECT COALESCE(SUM(block_count),0) FROM channels")
+        blocks = cursor.fetchone()[0] or 0
+
+        cursor.execute("SELECT show_count FROM promo WHERE id = 1")
+        promo_row = cursor.fetchone()
+        promo_shows = promo_row[0] if promo_row else 0
+
+        conn.close()
+
+        top_text = "\n".join(
+            [f"  • {p[0]}: {p[1]} دانلود" for p in top_posts]
+        ) if top_posts else "  —"
+
+        text = (
+            f"📅 گزارش روزانه ربات v{BOT_VERSION}\n"
+            f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"👤 کل کاربران: {total_users}\n"
+            f"🆕 کاربر جدید ۲۴س: {new_users}\n"
+            f"🚫 بن‌شده: {banned}\n\n"
+            f"👆 کلیک ۲۴س: {clicks_24}\n"
+            f"📥 دانلود ۲۴س: {downloads_24}\n\n"
+            f"📁 پست‌ها: {total_posts} (فعال: {active_posts})\n"
+            f"🏆 برترین لینک‌ها:\n{top_text}\n\n"
+            f"🔒 بلاک جوین اجباری: {blocks}\n"
+            f"💎 نمایش تبلیغ: {promo_shows}"
+        )
+        await context.bot.send_message(chat_id=int(log_ch), text=text)
+        logger.info("Daily report sent")
+    except Exception as e:
+        logger.error(f"Daily report error: {e}")
+
+
+async def check_daily_report_trigger(context: ContextTypes.DEFAULT_TYPE):
+    """هر ساعت چک می‌کند آیا ساعت گزارش روزانه رسیده"""
+    try:
+        hour = int(get_setting("daily_report_hour", "21") or "21")
+    except Exception:
+        hour = 21
+    now = datetime.now()
+    if now.hour == hour and now.minute < 5:
+        last = get_setting("last_daily_report_date", "")
+        today = now.strftime("%Y-%m-%d")
+        if last != today:
+            set_setting("last_daily_report_date", today)
+            await daily_report_job(context)
 
 # ---------------------------------------------------------
 # BROADCAST
@@ -1339,9 +1755,42 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ---------------------------------------------------------
+# HEALTH SERVER (برای Pxxl / health check)
+# ---------------------------------------------------------
+def start_health_server():
+    port = int(os.getenv("PORT", os.getenv("EXPOSE_PORT", "3000")))
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return  # quiet
+
+        def do_GET(self):
+            body = b'{"status":"ok","service":"telegram-bot","version":"' + BOT_VERSION.encode() + b'"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"Health server listening on 0.0.0.0:{port}")
+    except Exception as e:
+        logger.error(f"Health server failed: {e}")
+
+
+# ---------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------
 def main():
+    start_health_server()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1368,6 +1817,14 @@ def main():
         allow_reentry=True
     )
     app.add_handler(set_promo_handler)
+
+    set_promo_link_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_set_promo_link, pattern="^set_promo_link$")],
+        states={WAITING_PROMO_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_promo_link)]},
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        allow_reentry=True
+    )
+    app.add_handler(set_promo_link_handler)
 
     add_channel_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_add_channel, pattern="^add_channel$")],
@@ -1417,6 +1874,14 @@ def main():
     )
     app.add_handler(log_ch_handler)
 
+    dl_limit_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_set_dl_limit, pattern="^set_dl_limit_")],
+        states={WAITING_DOWNLOAD_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_dl_limit)]},
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        allow_reentry=True
+    )
+    app.add_handler(dl_limit_handler)
+
     # Callbacks
     app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_back$"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
@@ -1426,6 +1891,9 @@ def main():
     app.add_handler(CallbackQueryHandler(delete_post, pattern="^delete_post_"))
     app.add_handler(CallbackQueryHandler(promo_settings, pattern="^admin_promo_settings$"))
     app.add_handler(CallbackQueryHandler(toggle_promo, pattern="^toggle_promo$"))
+    app.add_handler(CallbackQueryHandler(toggle_promo_pin, pattern="^toggle_promo_pin$"))
+    app.add_handler(CallbackQueryHandler(reset_promo_count, pattern="^reset_promo_count$"))
+    app.add_handler(CallbackQueryHandler(unpin_all_promo, pattern="^unpin_all_promo$"))
     app.add_handler(CallbackQueryHandler(manage_channels, pattern="^admin_channels$"))
     app.add_handler(CallbackQueryHandler(channel_info, pattern="^ch_info_"))
     app.add_handler(CallbackQueryHandler(toggle_channel, pattern="^toggle_ch_"))
@@ -1435,9 +1903,11 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_verify_join, pattern="^verify_join_"))
     app.add_handler(CallbackQueryHandler(admin_backup, pattern="^admin_backup$"))
 
-    # Hourly log job
+    # Jobs
     if app.job_queue:
         app.job_queue.run_repeating(hourly_log_job, interval=3600, first=60)
+        # هر ۵ دقیقه چک برای گزارش روزانه در ساعت تنظیم‌شده
+        app.job_queue.run_repeating(check_daily_report_trigger, interval=300, first=120)
     else:
         logger.warning("JobQueue not available. Install: pip install 'python-telegram-bot[job-queue]'")
 
